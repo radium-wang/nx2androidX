@@ -77,4 +77,6 @@ Start with an empty Vulkan cache when the title build, shader bundle, host pipel
 3. Trigger an actual game vibration and check the player-one route and `first Droidplay rumble` line. The player confirms the physical feel.
 4. Trigger an in-game save, verify that the committed test tree changed, then restart from the library. Check that the saved progress returns and that the 5.1 pipeline cache loads. Verify the original backup hash before using a separately copied production save as `DM_SAVE`.
 
+In alpha12 the library's backup and import buttons use the app-private `files/save/<title-id>` directory. With the external `DM_SAVE` above, back up the committed SD-card tree directly after the game exits. A successful in-game save and reload verifies that external tree. LAN capability still comes from the game profile and its host. The Wonder profile reports `lan: false`.
+
 Keep logs, images, extracted data, caches, saves and keys in local build storage. The Mac build totals above describe artifact validation. Record device results from the exact pack and save copy that were exercised.
