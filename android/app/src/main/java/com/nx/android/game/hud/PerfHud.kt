@@ -25,6 +25,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.nx.android.data.AppVersion
 import com.nx.android.data.drivers.Drivers
 import com.nx.android.data.playback.PackEnvStore
@@ -72,32 +75,40 @@ private fun PerfHud(
     chargingText: String,
 ) {
     val ctx = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     var sample by remember { mutableStateOf<HudSample?>(null) }
     // the host's counters: the base of the frame rate's difference, kept across a change of the fields
     var prevHost by remember { mutableStateOf<HostSample?>(null) }
     var prevAt by remember { mutableLongStateOf(0L) }
 
     // the fields are the key: a change re-reads the device at once, so a newly picked field shows up right away
-    LaunchedEffect(fields) {
-        while (true) {
-            val now = SystemClock.elapsedRealtime()
-            val raw = runCatching { Native.perfSample() }.getOrNull()
-            if (raw != null && raw.size >= 5) {
-                val cur = HostSample(raw[0], raw[1], raw[2], raw[3], raw[4])
-                val stats = HudData.stats(prevHost, cur, now - prevAt)
-                prevHost = cur
-                prevAt = now
-                sample = HudSampler.take(ctx, fields).copy(
-                    gameFps = stats.gameFps,
-                    presentedFps = stats.presentedFps,
-                    frameMs = stats.frameMs,
-                    // the frame generation's state (the label follows it): an old host has no entry for it
-                    fgState = HudData.fgState(runCatching { Native.frameGenStatus() }.getOrNull()),
-                )
-            } else {
-                sample = HudSampler.take(ctx, fields)   // the host is not up yet: the device's readings alone
+    LaunchedEffect(fields, lifecycle) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            try {
+                while (true) {
+                    val now = SystemClock.elapsedRealtime()
+                    val raw = runCatching { Native.perfSample() }.getOrNull()
+                    if (raw != null && raw.size >= 5) {
+                        val cur = HostSample(raw[0], raw[1], raw[2], raw[3], raw[4])
+                        val stats = HudData.stats(prevHost, cur, now - prevAt)
+                        prevHost = cur
+                        prevAt = now
+                        sample = HudSampler.take(ctx, fields).copy(
+                            gameFps = stats.gameFps,
+                            presentedFps = stats.presentedFps,
+                            frameMs = stats.frameMs,
+                            // The label follows frame generation state when the host reports it.
+                            fgState = HudData.fgState(runCatching { Native.frameGenStatus() }.getOrNull()),
+                        )
+                    } else {
+                        sample = HudSampler.take(ctx, fields)
+                    }
+                    delay(1000)
+                }
+            } finally {
+                HudSampler.stopGpuSampling()
+                prevHost = null
             }
-            delay(1000)
         }
     }
 

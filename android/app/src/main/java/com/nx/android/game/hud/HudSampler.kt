@@ -12,15 +12,15 @@ import java.io.File
  * when its field is selected — an unselected field costs nothing (no file reads, no broadcast).
  *
  * The processor is the whole chip's busy share, from the cores' idle counters; the process's own times are the
- * fallback for the kernels that hide them. The GPU is the driver's busy share, latched (the driver publishes it
- * about once a second and answers "idle" while the GPU sleeps). The memory is the game's own (the game runs in
+ * fallback for the kernels that hide them. The GPU uses the driver's busy window when fresh or the app's
+ * KGSL timestamp estimate when it stalls. The memory is the game's own (the game runs in
  * this process) and the system's. The battery gives its temperature, its level and the current it draws.
  */
 object HudSampler {
 
     private const val SYS_CPU = "/sys/devices/system/cpu"
     private const val KGSL = "/sys/class/kgsl/kgsl-3d0"
-    /** How long a stale GPU busy window is held before it reads as idle */
+    /** How long to retain a published busy window between driver updates */
     private const val GPU_HOLD_MS = 5_000L
     /** Android's kernel ticks a second 100 times (USER_HZ) */
     private const val USER_HZ = 100L
@@ -33,17 +33,30 @@ object HudSampler {
     private var lastJiffies = -1L
     private var lastMs = 0L
     private var coreCount = 0
-    private var gpuLatched = 0f
-    private var gpuWindowAt = 0L
+    private val gpuWindows = KgslBusyHistory(GPU_HOLD_MS)
+    private var nativeGpuRunning = false
+    private val nativeGpuSupported by lazy {
+        try {
+            System.loadLibrary("nx2a_gpu_hud")
+            true
+        } catch (_: UnsatisfiedLinkError) {
+            false
+        }
+    }
+    @JvmStatic private external fun nativeGpuSample(enabled: Boolean): Int
 
     /** One tick: the readings of the selected fields */
     fun take(ctx: Context, fields: Set<HudField>): HudSample {
         if (HudField.CPU !in fields) resetCpu()
-        if (HudField.GPU !in fields) gpuWindowAt = 0L
+        val gpu = if (HudField.GPU in fields) gpuBusy() else {
+            gpuWindows.clear()
+            stopGpuSampling()
+            null
+        }
         val battery = if (HudField.POWER in fields || HudField.TEMP in fields) battery(ctx, HudField.POWER in fields) else null
         return HudSample(
             cpuPercent = if (HudField.CPU in fields) cpuPercent() else null,
-            gpuPercent = if (HudField.GPU in fields) gpuBusy() else null,
+            gpuPercent = gpu,
             appRamMb = if (HudField.APP_RAM in fields) appRamMb() else null,
             sysRamUsedMb = if (HudField.SYS_RAM in fields) sysRamUsedMb() else null,
             sysRamTotalMb = if (HudField.SYS_RAM in fields) sysRamTotalMb() else null,
@@ -138,23 +151,35 @@ object HudSampler {
         return coreCount
     }
 
-    /**
-     * The GPU's busy share from the driver's own counter. The kernel publishes a new window about once a second
-     * of GPU-on time and answers "0 0" while the GPU sleeps, so a raw poll would read as idle mid-game: latch
-     * each published value, hold it through the gaps, and only call it idle after the hold has passed.
-     */
     private fun gpuBusy(): Float? {
+        val published = publishedGpuBusy()
+        if (published != null) {
+            stopGpuSampling()
+            return published
+        }
+        if (!nativeGpuSupported) return null
+        nativeGpuRunning = true
+        return nativeGpuSample(true).takeIf { it in 0..100 }?.toFloat()
+    }
+
+    fun stopGpuSampling() {
+        if (!nativeGpuRunning) return
+        nativeGpuSample(false)
+        nativeGpuRunning = false
+    }
+
+    private fun publishedGpuBusy(): Float? {
+        val scaling = runCatching { File("$KGSL/pwrscale").readText().trim() }.getOrNull()
+        if (scaling == "0") {
+            gpuWindows.clear()
+            return null
+        }
         val raw = runCatching { File("$KGSL/gpubusy").readText().trim() }.getOrNull()
         val parts = raw?.split(Regex("\\s+"))?.map { it.toLongOrNull() }
         val busy = parts?.getOrNull(0)
         val total = parts?.getOrNull(1)
         if (busy != null && total != null) {
-            val now = SystemClock.elapsedRealtime()
-            if (total > 0) {
-                gpuLatched = (busy * 100f / total).coerceIn(0f, 100f)
-                gpuWindowAt = now
-            } else if (gpuWindowAt != 0L && now - gpuWindowAt > GPU_HOLD_MS) gpuLatched = 0f
-            return gpuLatched
+            return gpuWindows.update(busy, total, SystemClock.elapsedRealtime())
         }
         for (path in listOf("$KGSL/devfreq/gpu_load", "$KGSL/gpu_busy_percentage")) {
             val v = runCatching { Regex("-?\\d+").find(File(path).readText())?.value?.toFloat() }.getOrNull() ?: continue

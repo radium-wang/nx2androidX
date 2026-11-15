@@ -28,6 +28,7 @@ DEFAULT_OUT = Path(__file__).resolve().parent / '.cache' / 'assets' / 'tool' / '
 DEFAULT_JNI_OUT = Path(__file__).resolve().parent / '.cache' / 'jniLibs' / 'arm64-v8a'
 API = '31'                       # the API the host is built for (dm/android/build.py --api)
 LOADER = 'libadrenotools.so'     # the one the host dlopens by name: it goes into the app's native library folder
+GPU_HUD = REPO / 'android' / 'app' / 'src' / 'main' / 'cpp' / 'monitor_gpu.c'
 
 
 def find_ndk(given):
@@ -92,11 +93,15 @@ def main():
         if strip.is_file():
             subprocess.run([str(strip), '--strip-unneeded', str(o)], capture_output=True, text=True)
         print(f'   {name:32} {o.stat().st_size / 1024:8.0f} KB')
-    # the loader alone goes into the app's native library folder: the host dlopens it by name, and that folder is
-    # the one the linker searches (the app's private host folder is not on any of its paths)
+    # The loader and the HUD sampler go into the app's native library folder.
     jni.mkdir(parents=True, exist_ok=True)
     shutil.copy2(out / LOADER, jni / LOADER)
     print(f'   {LOADER:32} -> {jni} ({((jni / LOADER).stat().st_size / 1024):.0f} KB, the app\'s native library folder)')
+    subprocess.run([
+        str(bin_ / 'clang'), '--target=aarch64-linux-android26', '-Wall', '-Wextra', '-Werror',
+        '-O2', '-fPIC', '-shared', '-Wl,-z,max-page-size=16384', str(GPU_HUD),
+        '-Wl,-soname,libnx2a_gpu_hud.so', '-o', str(jni / 'libnx2a_gpu_hud.so'),
+    ], check=True)
     return 0
 
 
