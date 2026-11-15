@@ -1,0 +1,26 @@
+#version 450
+
+// A GOB is 512 bytes: 32 contiguous 16-byte segments laid out over 8 rows.
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) readonly buffer Tiled { uvec4 segments[]; } src;
+layout(set = 0, binding = 1, std430) writeonly buffer Linear { uvec4 segments[]; } dst;
+layout(push_constant) uniform Params {
+    uint pitch_segments;
+    uint rows;
+    uint gobs_x;
+    uint block_height_shift;
+} p;
+
+void main() {
+    uint segment = gl_LocalInvocationID.x;
+    uint gob_x = gl_WorkGroupID.x;
+    uint gob_y = gl_WorkGroupID.y;
+    uint x = gob_x * 4u + ((segment >> 4u) << 1u) + ((segment >> 1u) & 1u);
+    uint y = gob_y * 8u + (((segment >> 2u) & 3u) << 1u) + (segment & 1u);
+    if (x >= p.pitch_segments || y >= p.rows)
+        return;
+    uint block_height = 1u << p.block_height_shift;
+    uint gob = ((gob_y >> p.block_height_shift) * p.gobs_x + gob_x) * block_height
+             + (gob_y & (block_height - 1u));
+    dst.segments[y * p.pitch_segments + x] = src.segments[gob * 32u + segment];
+}

@@ -36,8 +36,8 @@ def production():
     drvs = replay[replay.index('static uint32_t g_dispatch'):replay.index('// vk_samp_by_id without')]
     cache = replay[replay.index('enum { SETC'):replay.index('// A binding that runs past')]
     memo = replay[replay.index('enum { MEMO_CB'):replay.index('// ---------------- draws')]
-    indirect = replay[replay.index('static void compute_warm_start(void) {'):replay.index('// ---------------- copies and clears')]
-    indirect = indirect[indirect.index('\n}') + 2:]
+    indirect = replay[replay.index('// Validate all three indirect argument words'):
+                      replay.index('// ---------------- copies and clears')]
     ubd = core[core.index('typedef struct { uint64_t lo, hi; VkBuffer sb;'):core.index('// the draw bisection')]
     infl = core[core.index('typedef struct { uint64_t lo, hi, fence; const uint8_t *data; uint8_t *own; }'):core.index('int vk_ubd_overlaps')]
     functions = ''.join(function(core, sig) for sig in [

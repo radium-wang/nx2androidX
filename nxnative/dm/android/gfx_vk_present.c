@@ -1151,6 +1151,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
           if (g_order_kept + g_order_ended > pk + pn) VKLOG("order-only barriers per frame (last 600): %.1f kept inside their pass, %.1f ended it", (g_order_kept - pk) / 600.0, (g_order_ended - pn) / 600.0);
           pk = g_order_kept; pn = g_order_ended; }
         void vk_pass_report(void); vk_pass_report();
+        extern uint64_t g_ubd_filter_checks, g_ubd_filter_rejects;
+        if (g_ubd_filter_checks) VKLOG("uniform lookup through present %llu: %llu/%llu lookups skipped the update scan",
+            (unsigned long long)n, (unsigned long long)g_ubd_filter_rejects, (unsigned long long)g_ubd_filter_checks);
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }
     if (!im) { no_img++; return present_enqueue(NULL, NULL, n, period); }

@@ -6,6 +6,7 @@
 // The strength follows an envelope (BananaNative's Rumble.java): every TICK_NS the strongest level the game set since the last tick, not the latest one, and once the
 // game goes quiet a fall of FALL a tick (about 0.2 s from full to off). Switch 2 games stream HD rumble (Donkey Kong Bananza: 400 values a second, short peaks with
 // near-silence between); taking the latest value mostly lands on the silence or cuts each buzz short, so the motor never spins up.
+// DM_RUMBLE_MODE=droidplay uses Droidplay's latest level and immediate stop for player 1.
 #include "dm.h"
 #include "hle_haptics.h"
 #include <jni.h>
@@ -21,6 +22,8 @@
 #define FALL 0.6f            // the envelope's fall per tick once the game is quiet
 #define MOVE 6               // a new vibration only when the strength moved this much (of 255)
 #define GAP_NS 25000000ll    // a running rumble waits this long after a tap, so it does not replace the tap
+#define DROIDPLAY_RUMBLE_MS 1000
+#define DROIDPLAY_RENEW_NS 800000000ll
 static JavaVM *g_vm; static jobject g_actobj;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static dm_haptic_state g_state[DM_PLAYERS];   // the game's last rumble, per player
@@ -29,11 +32,23 @@ static float g_env[DM_PLAYERS];               // the envelope, per player (the t
 static int g_taps, g_clear;                   // g_clear: a bit per player (a new epoch: the older level is dropped)
 static int g_dev[DM_PLAYERS];                 // the controller that plays each player (-1: the device's own body)
 static int g_dev_new;                         // a device changed: the vibrators are taken again
+static int g_droidplay, g_latest_changed;
+static float g_droidplay_gain = 1;
 static _Atomic int g_on = 1;
 static int64_t mono_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
 static void sink(dm_haptic_state s) {   // hle_haptics.c, under its lock: only hand the state over
     int p = s.player;
     if (p < 0 || p >= DM_PLAYERS) return;
+    if (g_droidplay) {
+        if (p != 0) return;
+        pthread_mutex_lock(&g_mu);
+        if (s.epoch != g_state[0].epoch) g_clear |= 1;
+        g_state[0] = s;
+        g_latest_changed = 1;
+        pthread_cond_signal(&g_cv);
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
     float lv = dm_haptics_level(s.motor, 2, 1.0f).intensity;
     pthread_mutex_lock(&g_mu);
     if (s.epoch != g_state[p].epoch) { g_peak[p] = 0; g_clear |= 1 << p; pthread_cond_signal(&g_cv); }   // a new epoch drops everything older: stop at once, no fall
@@ -49,6 +64,8 @@ void dm_haptics_android_set(int on) { atomic_store(&g_on, on != 0); pthread_mute
 
 static JNIEnv *E;
 static jclass cVE, cID; static jmethodID mOneShot, mPredef, mVibrate, mCancel, mHas, mAmp, mGetDevice, mGetVib, mGetVibMgr, mGetDefault;
+static jmethodID mVibrateGame;
+static jobject g_game_audio;
 typedef struct { jobject v; int amp; } vib_t;   // a Vibrator (global reference) and whether it controls amplitude
 typedef struct { vib_t *v; int amp; int64_t last; } chan_t;   // what is playing now: the target, the strength, when it started
 static int jok(const char *what) {
@@ -77,6 +94,58 @@ static void vib_tap(vib_t *v) {   // a short, light tick; without amplitude cont
 }
 static void vib_stop(vib_t *v) { (*E)->CallVoidMethod(E, v->v, mCancel); jok("cancel"); }
 
+static void droidplay_game_audio(jclass vibrator) {
+    // Same Android game-usage attributes as Droidplay's Gamepad.rumble.
+    jclass cls = (*E)->FindClass(E, "android/media/AudioAttributes$Builder");
+    if (!jok("AudioAttributes.Builder") || !cls) return;
+    jmethodID init = (*E)->GetMethodID(E, cls, "<init>", "()V");
+    jmethodID usage = (*E)->GetMethodID(E, cls, "setUsage", "(I)Landroid/media/AudioAttributes$Builder;");
+    jmethodID build = (*E)->GetMethodID(E, cls, "build", "()Landroid/media/AudioAttributes;");
+    mVibrateGame = (*E)->GetMethodID(E, vibrator, "vibrate", "(Landroid/os/VibrationEffect;Landroid/media/AudioAttributes;)V");
+    if (jok("game vibration methods") && init && usage && build && mVibrateGame) {
+        jobject builder = (*E)->NewObject(E, cls, init);
+        if (jok("create game audio attributes") && builder) {
+            jobject self = (*E)->CallObjectMethod(E, builder, usage, (jint)14 /* AudioAttributes.USAGE_GAME */);
+            if (jok("set game vibration usage")) {
+                jobject audio = (*E)->CallObjectMethod(E, builder, build);
+                if (jok("build game audio attributes") && audio) {
+                    g_game_audio = (*E)->NewGlobalRef(E, audio);
+                    (*E)->DeleteLocalRef(E, audio);
+                }
+            }
+            if (self) (*E)->DeleteLocalRef(E, self);
+            (*E)->DeleteLocalRef(E, builder);
+        }
+    }
+    (*E)->DeleteLocalRef(E, cls);
+}
+
+static int64_t droidplay_rumble(chan_t *channel, vib_t *target, float level, float *last_level,
+                                int64_t now, int64_t blocked_until) {
+    if (channel->amp && (target != channel->v || level < 0.02f)) {
+        vib_stop(channel->v);
+        *channel = (chan_t){0};
+    }
+    if (!target || level < 0.02f) return INT64_MAX;
+    if (now < blocked_until) return blocked_until;
+    if (!channel->amp || level != *last_level || now - channel->last >= DROIDPLAY_RENEW_NS) {
+        int amp = (int)(level * 255 + 0.5f);
+        int was_playing = channel->amp != 0;
+        if (g_game_audio) {
+            jobject effect = (*E)->CallStaticObjectMethod(E, cVE, mOneShot, (jlong)DROIDPLAY_RUMBLE_MS, (jint)(target->amp ? amp : -1));
+            if (jok("create Droidplay vibration") && effect) {
+                (*E)->CallVoidMethod(E, target->v, mVibrateGame, effect, g_game_audio);
+                jok("play Droidplay vibration");
+                (*E)->DeleteLocalRef(E, effect);
+            }
+        } else vib_play(target, DROIDPLAY_RUMBLE_MS, amp);
+        if (!was_playing && *last_level < 0) LOG("[haptics] first Droidplay rumble: strength %d/255", amp);
+        *channel = (chan_t){target, amp, now};
+        *last_level = level;
+    }
+    return channel->last + DROIDPLAY_RENEW_NS;
+}
+
 static void *haptics_thread(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "haptics"); crash_thread_init();
     if ((*g_vm)->AttachCurrentThread(g_vm, &E, NULL) != JNI_OK) { LOG("[RED] [haptics] cannot attach to the Java VM"); return NULL; }
@@ -90,6 +159,7 @@ static void *haptics_thread(void *a) {
     mHas = (*E)->GetMethodID(E, cVib, "hasVibrator", "()Z"); mAmp = (*E)->GetMethodID(E, cVib, "hasAmplitudeControl", "()Z");
     mGetDevice = (*E)->GetStaticMethodID(E, cID, "getDevice", "(I)Landroid/view/InputDevice;"); mGetVib = (*E)->GetMethodID(E, cID, "getVibrator", "()Landroid/os/Vibrator;");
     if (!jok("GetMethodID")) { LOG("[RED] [haptics] Vibrator methods missing"); return NULL; }
+    if (g_droidplay) droidplay_game_audio(cVib);
     int sdk = 0;   // Android 11 and newer: the device's motor is behind the vibrator manager, not the device itself
     jclass cBuild = (*E)->FindClass(E, "android/os/Build$VERSION");
     if (cBuild) { jfieldID f = (*E)->GetStaticFieldID(E, cBuild, "SDK_INT", "I"); if (f && jok("GetStaticFieldID")) sdk = (*E)->GetStaticIntField(E, cBuild, f); }
@@ -107,15 +177,22 @@ static void *haptics_thread(void *a) {
     vib_t pad[DM_PLAYERS]; int pad_id[DM_PLAYERS]; chan_t ch[DM_PLAYERS]; chan_t phone;
     for (int p = 0; p < DM_PLAYERS; p++) { memset(&pad[p], 0, sizeof pad[p]); pad_id[p] = -2; memset(&ch[p], 0, sizeof ch[p]); }
     memset(&phone, 0, sizeof phone);
-    int was_on = 1; int64_t last = 0, next = 0, tap_end = 0;
+    int was_on = 1; int64_t next = 0, tap_end = 0;
+    float last_level = -1;
     for (;;) {
         pthread_mutex_lock(&g_mu);
         for (;;) {   // asleep until a tap, a device change, the setting, or rumble to play; while the envelope runs, a tick every TICK_NS
             int64_t t = mono_now(); int on = atomic_load(&g_on);
             if (g_taps || g_dev_new || g_clear) break;
             if (on != was_on) { next = t; break; }   // the setting changed: a tick now, so a held rumble comes back or stops
-            int busy = phone.amp != 0;
-            for (int p = 0; p < DM_PLAYERS; p++) if (g_peak[p] > 0 || g_env[p] > 0 || ch[p].amp) busy = 1;
+            int busy;
+            if (g_droidplay) {
+                if (g_latest_changed) break;
+                busy = next != INT64_MAX;
+            } else {
+                busy = phone.amp != 0;
+                for (int p = 0; p < DM_PLAYERS; p++) if (g_peak[p] > 0 || g_env[p] > 0 || ch[p].amp) busy = 1;
+            }
             if (!busy) { pthread_cond_wait(&g_cv, &g_mu); continue; }   // idle: sleep until a level arrives
             if (t >= next) break;
             struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); int64_t w = next - t; dl.tv_sec += w / 1000000000; dl.tv_nsec += w % 1000000000;
@@ -125,7 +202,7 @@ static void *haptics_thread(void *a) {
         int taps = g_taps, dn = g_dev_new, clear = g_clear;
         dm_haptic_state st[DM_PLAYERS]; float peak[DM_PLAYERS]; int ids[DM_PLAYERS];
         memcpy(st, g_state, sizeof st); memcpy(peak, g_peak, sizeof peak); memcpy(ids, g_dev, sizeof ids);
-        g_taps = 0; g_dev_new = 0; g_clear = 0;
+        g_taps = 0; g_dev_new = 0; g_clear = 0; g_latest_changed = 0;
         int64_t t = mono_now(), tick = t >= next;
         if (tick) for (int p = 0; p < DM_PLAYERS; p++) g_peak[p] = 0;
         pthread_mutex_unlock(&g_mu);
@@ -159,6 +236,13 @@ static void *haptics_thread(void *a) {
             g_env[p] = 0; if (ch[p].amp) { vib_stop(ch[p].v); ch[p].v = NULL; ch[p].amp = 0; }
         }
         if (taps && dev.v && was_on) { vib_tap(&dev); tap_end = t + GAP_NS; if (phone.v == &dev && phone.amp) phone.last = t - RENEW_NS + GAP_NS; }   // a running rumble comes back after the tap
+        if (g_droidplay) {
+            vib_t *target = pad[0].v ? &pad[0] : dev.v ? &dev : NULL;
+            float level = was_on ? dm_haptics_level(st[0].motor, 2, g_droidplay_gain).intensity : 0;
+            if (taps && ch[0].v == &dev) ch[0].last = 0;
+            next = droidplay_rumble(&ch[0], target, level, &last_level, t, target == &dev ? tap_end : 0);
+            continue;
+        }
         int playing = phone.amp != 0;
         for (int p = 0; p < DM_PLAYERS; p++) if (ch[p].amp) playing = 1;
         if (!tick && !dn && !clear && !taps && !( !was_on && playing)) continue;
@@ -207,6 +291,14 @@ void dm_haptics_android_start(JNIEnv *E, JavaVM *vm, jobject actctx, int on) {
     g_vm = vm;
     g_actobj = (E && actctx) ? (*E)->NewGlobalRef(E, actctx) : NULL;
     if (E && actctx && !g_actobj && (*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); LOG("[RED] [haptics] cannot keep the context: no vibration"); }
+    const char *mode = getenv("DM_RUMBLE_MODE");
+    g_droidplay = mode && !strcmp(mode, "droidplay");
+    if (g_droidplay) {
+        const char *gain = getenv("DM_RUMBLE_GAIN");
+        float value = gain ? strtof(gain, NULL) : 1;
+        if (value > 0 && value <= 3) g_droidplay_gain = value;
+        LOG("[haptics] Droidplay mode: latest level, gain %.2f, cutoff 2%%", g_droidplay_gain);
+    }
     atomic_store(&g_on, on != 0);
     dm_haptics_init(sink, 1);
     pthread_t t; if (!pthread_create(&t, NULL, haptics_thread, NULL)) pthread_detach(t);

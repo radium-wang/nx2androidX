@@ -1,7 +1,7 @@
 // Android port, Vulkan backend: formats, textures, views, samplers and the texture / sampler ID tables (see gfx_vk.h).
 //   A texture object's image is found by its storage: textures over the same pool, offset and description share one image (as nvn_mtl.m's storage-sharing
 //   table), which is how a render target and the texture a later pass samples it through meet. A packaged texture (packaged layout, CPU-written) is filled
-//   from the guest's block-linear bytes (nvn_deswizzle on the CPU into scratch memory, copied in by the upload command buffer) and filled again when the
+//   from the guest's block-linear bytes (converted on the CPU or on the upload command buffer) and filled again when the
 //   dirty-page tracker saw a write to its pages; any other texture is the GPU's (render targets, images), filled only by GPU work.
 //   Version 1 keeps every image in VK_IMAGE_LAYOUT_GENERAL after its first use, ordered by whole-pipeline barriers.
 #include "gfx_vk.h"
@@ -11,6 +11,7 @@
 #include <string.h>
 #include <math.h>
 #include "../gfx/tex/nvn_bc.h"
+#include "detile_comp.spv.h"
 
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp);
 const void *nvn_dirty_span(const void *addr, size_t len);
@@ -304,6 +305,149 @@ int nvn_sparse_pool(const void *pool); uint64_t nvn_sparse_gen(void); uint64_t n
 int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp); void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n);
 static int sparse_tex(const tex_t *t) { return t->pool && nvn_sparse_pool(t->pool); }
 uint64_t g_pkg_n, g_pkg_bytes, g_pkg_ns;   // packaged texture uploads: count, bytes, CPU time (the replay's per-frame line)
+static uint64_t g_detile_count, g_detile_bytes;
+static VkDescriptorSetLayout g_detile_set;
+static VkPipelineLayout g_detile_layout;
+static VkPipeline g_detile_pipeline;
+
+static int detile_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *setting = getenv("DM_VK_GPU_DETILE");
+        int requested = setting ? atoi(setting) : 0;
+        mode = requested == 1 || requested == 2 ? requested : 0;
+    }
+    return mode;
+}
+
+static int detile_pipeline(void) {
+    static int attempted;
+    if (attempted) return g_detile_pipeline != VK_NULL_HANDLE;
+    attempted = 1;
+    VkDescriptorSetLayoutBinding bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+    };
+    VkDescriptorSetLayoutCreateInfo si = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 2, bindings};
+    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 4 * sizeof(uint32_t)};
+    VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_detile_set, 1, &push};
+    VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof detile_comp_spv, detile_comp_spv};
+    VkShaderModule shader = VK_NULL_HANDLE;
+    if (!vkCreateDescriptorSetLayout(V.dev, &si, NULL, &g_detile_set) &&
+        !vkCreatePipelineLayout(V.dev, &li, NULL, &g_detile_layout) &&
+        !vkCreateShaderModule(V.dev, &mi, NULL, &shader)) {
+        VkComputePipelineCreateInfo ci = {
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", NULL},
+            .layout = g_detile_layout,
+        };
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipeline) == VK_SUCCESS)
+            g_detile_pipeline = pipeline;
+        vkDestroyShaderModule(V.dev, shader, NULL);
+    }
+    if (g_detile_pipeline) {
+        void vk_dsl_register(VkDescriptorSetLayout, const VkDescriptorSetLayoutBinding *, uint32_t);
+        vk_dsl_register(g_detile_set, bindings, 2);
+        VKLOG("packaged texture detile: Vulkan compute enabled");
+        return 1;
+    }
+    if (g_detile_layout) vkDestroyPipelineLayout(V.dev, g_detile_layout, NULL);
+    if (g_detile_set) vkDestroyDescriptorSetLayout(V.dev, g_detile_set, NULL);
+    VKLOG("packaged texture detile: compute pipeline unavailable, using CPU");
+    return 0;
+}
+
+static int pkg_detile(VkCommandBuffer cb, vkimg_t *im, const tex_t *t, const vkfmt_t *f,
+                      unsigned level, unsigned layer, uint32_t width, uint32_t height,
+                      size_t pitch, size_t bytes) {
+    // Small uploads stay on the CPU. Limit individual allocations from the submission scratch arena.
+    int mode = detile_mode();
+    if (!mode || bytes < (32u << 10) || bytes > (8u << 20) || (im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) ||
+        !f->bpb || 16u % f->bpb) return 0;
+    uint32_t row_bytes, rows, slices, bpb;
+    unsigned th, td;
+    uint64_t base;
+    if (nvn_deswizzle_geom(&t->d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb) ||
+        slices != 1 || td != 0 || !rows || row_bytes != pitch || bpb != f->bpb) return 0;
+    uint32_t padded_pitch = (row_bytes + 15u) & ~15u;
+    uint32_t columns = (row_bytes + 63u) / 64u, gob_rows = (rows + 7u) / 8u;
+    uint32_t gobs_x = nvn_tex_level_gobs(&t->d, level);
+    if (gobs_x < columns) gobs_x = columns;
+    uint64_t src_bytes = nvn_bl_offset(padded_pitch - 16u, rows - 1u, 0, gobs_x * 64u, rows, th, 0) + 16u;
+    uint64_t dst_bytes = (uint64_t)padded_pitch * rows;
+    const VkPhysicalDeviceLimits *limits = &V.props.limits;
+    if (base > t->L.size || src_bytes > t->L.size - base || src_bytes > (8u << 20) ||
+        src_bytes > limits->maxStorageBufferRange || dst_bytes > limits->maxStorageBufferRange ||
+        columns > limits->maxComputeWorkGroupCount[0] || gob_rows > limits->maxComputeWorkGroupCount[1]) return 0;
+    VkDeviceSize align = limits->minStorageBufferOffsetAlignment;
+    if (align < 16) align = 16;
+    VkBuffer source, output;
+    VkDeviceSize source_off, output_off;
+    if (mode == 2) {
+        // Only use direct reads for packaged compressed textures in CPU-inaccessible GPU memory.
+        // CPU-visible textures need a snapshot because they can change before the command runs.
+        if (!t->has_layout || !f->compressed || !t->pool || im->packaged != 2 || im->gpu_w ||
+            !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+            (t->pool->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) return 0;
+        uint64_t addr = (uintptr_t)t->mem + base;
+        vkpool_t *pool = vk_pool_of(addr, src_bytes);
+        if (!pool || !pool->zero_copy || pool->noncoherent) return 0;
+        source = pool->buf;
+        source_off = addr - pool->lo + pool->boff;
+        if (source_off % align || !detile_pipeline()) return 0;
+        VkMemoryBarrier read = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &read, 0, NULL, 0, NULL);
+    } else {
+        if (!detile_pipeline()) return 0;
+        void *snapshot = vk_scratch(src_bytes, align, &source, &source_off);
+        memcpy(snapshot, t->mem + base, src_bytes);
+    }
+    void *mapped_output = vk_scratch(dst_bytes, align, &output, &output_off);
+    static int checks = -1;
+    if (checks < 0) {
+        const char *setting = getenv("DM_VK_GPU_DETILE_CHECK");
+        checks = setting && atoi(setting) ? 32 : 0;
+    }
+    int check = checks > 0;
+    if (check) {
+        VkBuffer reference_buffer;
+        VkDeviceSize reference_offset;
+        void *reference = vk_scratch(bytes, 16, &reference_buffer, &reference_offset);
+        // The original swizzle API addresses the mip by its offset in the full texture.
+        if (!nvn_deswizzle(&t->d, level, layer, t->mem, reference, row_bytes)) {
+            void vk_check_detile(const void *, const void *, uint32_t, uint32_t, uint32_t);
+            vk_check_detile(mapped_output, reference, row_bytes, rows, padded_pitch);
+            checks--;
+        }
+    }
+    VkDescriptorSet set = vk_alloc_set(g_detile_set);
+    VkDescriptorBufferInfo buffers[] = {{source, source_off, src_bytes}, {output, output_off, dst_bytes}};
+    VkWriteDescriptorSet writes[] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &buffers[0]},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &buffers[1]},
+    };
+    vkUpdateDescriptorSets(V.dev, 2, writes, 0, NULL);
+    uint32_t params[] = {padded_pitch / 16u, rows, gobs_x, th};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_detile_pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_detile_layout, 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(cb, g_detile_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, params);
+    vkCmdDispatch(cb, columns, gob_rows, 1);
+    VkBufferMemoryBarrier barrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, NULL,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | (check ? VK_ACCESS_HOST_READ_BIT : 0), VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, output, output_off, dst_bytes};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | (check ? VK_PIPELINE_STAGE_HOST_BIT : 0),
+                         0, 0, NULL, 1, &barrier, 0, NULL);
+    uint32_t row_texels = padded_pitch == row_bytes ? 0 : padded_pitch / bpb * (f->bw ? f->bw : 1);
+    VkBufferImageCopy region = {output_off, row_texels, 0, {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+                                {0, 0, 0}, {width, height, 1}};
+    vkCmdCopyBufferToImage(cb, output, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    g_detile_count++;
+    g_detile_bytes += bytes;
+    return 1;
+}
+
 static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
 static uint64_t pkg_hash(const uint8_t *m, size_t n) {   // FNV-1a over 8-byte words
     uint64_t h = 1469598103934665603ull; size_t i = 0;
@@ -345,6 +489,8 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = im->d >> lv ? im->d >> lv : 1;
         uint32_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh; size_t pitch = (size_t)bx * bpb, slab = pitch * by * z;
         for (unsigned ly = 0; ly < im->layers; ly++) {
+            if (!linear && !im->pkg_sparse && !f->dec && z == 1 && im->d == 1 &&
+                pkg_detile(cb, im, t, f, lv, ly, w, h, pitch, slab)) continue;
             VkBuffer sb; VkDeviceSize so; uint8_t *blocks = f->dec ? malloc(slab) : NULL, *dst = blocks ? blocks : vk_scratch(slab, 16, &sb, &so);
             if (f->dec && !blocks) { free(copy); return; }
             if (linear) {   // linear storage: rows of the texture's stride, one level, one layer
@@ -466,6 +612,13 @@ typedef struct { uint64_t used; vkimg_t *im; } pkg_age;
 static int pkg_age_cmp(const void *a, const void *b) { uint64_t x = ((const pkg_age *)a)->used, y = ((const pkg_age *)b)->used; return x < y ? -1 : x > y; }
 void vk_tex_sweep(void) {
     if (++g_tex_frame % 300) return;
+    if (detile_mode()) VKLOG("packaged texture detile: %llu levels / %.2f MiB on GPU through present %llu",
+        (unsigned long long)g_detile_count, g_detile_bytes / 1048576.0, (unsigned long long)g_tex_frame);
+    if (g_tex_frame <= 1800) {
+        const char *profile = getenv("DM_VK_PROF_SLOW");
+        if (profile && atoi(profile)) VKLOG("packaged texture totals through present %llu: %llu uploads, %.2f MiB, %.2f ms CPU",
+            (unsigned long long)g_tex_frame, (unsigned long long)g_pkg_n, g_pkg_bytes / 1048576.0, g_pkg_ns / 1e6);
+    }
     uint64_t idle = 0, lru = 0, before = nvn_dirty_released();
     pthread_mutex_lock(&g_img_mu);
     pkg_age *v = NULL; size_t nv = 0, cap = 0;

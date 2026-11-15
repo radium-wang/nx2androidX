@@ -1408,6 +1408,11 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
 
 // ---------------- submissions: begin, CPU-visible effects, commit ----------------
 static void post(post_op o) { vksub_t *s = cur(); if (s->npost == s->cappost) { s->cappost = s->cappost ? 2 * s->cappost : 64; s->post = realloc(s->post, s->cappost * sizeof *s->post); } s->post[s->npost++] = o; }
+void vk_check_detile(const void *output, const void *reference, uint32_t row_bytes, uint32_t rows, uint32_t pitch) {
+    // With completion-based recycling, both scratch regions live through this check.
+    if (g_prereset > 0)
+        post((post_op){3, (volatile uint32_t *)output, rows, row_bytes, (uintptr_t)reference, pitch, -1});
+}
 void mtl_init(void) { vk_init(); }
 static int g_shadow_pools;
 static void pools_readback_barrier(VkCommandBuffer cb) {
@@ -1487,6 +1492,64 @@ void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
 typedef struct { uint64_t lo, hi; VkBuffer sb; VkDeviceSize so; const uint8_t *p; uint8_t *own; } ubd_t;   // p: the bytes for CPU readers (own, or the scratch copy); own: their heap copy, freed with the entry
 enum { UBD_MAX = 512 };
 static ubd_t g_ubd[UBD_MAX]; static int g_nubd; extern int g_ubd_heap; uint64_t g_ubd_gen = 1, g_ubd_landed, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_ubd_superseded;
+uint64_t g_ubd_filter_checks, g_ubd_filter_rejects;
+enum { UBD_FILTER_WORDS = 16, UBD_FILTER_PAGE_SHIFT = 12 };
+static uint64_t g_ubd_filter_pages[UBD_FILTER_WORDS];
+static uint64_t g_ubd_filter_lo = UINT64_MAX, g_ubd_filter_hi;
+static int g_ubd_filter_wide;
+
+static int ubd_filter_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *setting = getenv("DM_VK_UBO_LOOKUP");
+        on = setting && atoi(setting);
+    }
+    return on;
+}
+
+static unsigned ubd_filter_bit(uint64_t page) {
+    return (unsigned)((page ^ (page >> 10) ^ (page >> 20)) & (UBD_FILTER_WORDS * 64 - 1));
+}
+
+static void ubd_filter_add(uint64_t lo, uint64_t hi) {
+    if (lo < g_ubd_filter_lo) g_ubd_filter_lo = lo;
+    if (hi > g_ubd_filter_hi) g_ubd_filter_hi = hi;
+    uint64_t first = lo >> UBD_FILTER_PAGE_SHIFT, last = (hi - 1) >> UBD_FILTER_PAGE_SHIFT;
+    if (last - first >= 32) g_ubd_filter_wide = 1;
+    if (g_ubd_filter_wide) return;
+    for (uint64_t page = first; page <= last; page++) {
+        unsigned bit = ubd_filter_bit(page);
+        g_ubd_filter_pages[bit / 64] |= 1ull << (bit % 64);
+    }
+}
+
+// A missing page proves there is no overlapping update. Hash collisions only
+// send a query through the ordinary exact lookup.
+static int ubd_filter_miss(uint64_t lo, uint64_t hi) {
+    g_ubd_filter_checks++;
+    if (lo < g_ubd_filter_hi && g_ubd_filter_lo < hi) {
+        if (g_ubd_filter_wide) return 0;
+        uint64_t first = lo >> UBD_FILTER_PAGE_SHIFT, last = (hi - 1) >> UBD_FILTER_PAGE_SHIFT;
+        if (last - first >= 32) return 0;
+        for (uint64_t page = first; page <= last; page++) {
+            unsigned bit = ubd_filter_bit(page);
+            if (g_ubd_filter_pages[bit / 64] & (1ull << (bit % 64))) return 0;
+        }
+    }
+    g_ubd_filter_rejects++;
+    return 1;
+}
+
+static void ubd_clear(void) {
+    g_nubd = 0;
+    g_ubd_gen++;
+    if (!ubd_filter_on()) return;
+    g_ubd_filter_lo = UINT64_MAX;
+    g_ubd_filter_hi = 0;
+    g_ubd_filter_wide = 0;
+    memset(g_ubd_filter_pages, 0, sizeof g_ubd_filter_pages);
+}
+
 void vk_end_pass_land(void);
 void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     VkBuffer db, sb; VkDeviceSize dof, so;
@@ -1506,6 +1569,7 @@ void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     // 11.3 ms, vk_ubd_read 25-39% -> 6% of the samples. DM_VK_UBD_HEAP=0 (live): none, as before
     uint8_t *own = g_ubd_heap && n <= 4096 ? malloc(n) : NULL; if (own) memcpy(own, data, n);
     g_ubd[g_nubd++] = (ubd_t){dst, dst + n, sb, so, own ? own : p, own}; g_ubd_gen++;
+    if (ubd_filter_on()) ubd_filter_add(dst, dst + n);
 }
 // the draw bisection (gfx_vk_exec.c draw_allowed): the outcome of this submission
 extern int g_bis_on, g_bis_lo, g_bis_hi, g_bis_trace, g_bis_var; void vk_bisect_reset_count(void);
@@ -1524,7 +1588,7 @@ static void vk_bisect_result(int ok) {
     if (g_bis_hi - g_bis_lo <= 1) { done = 1; g_bis_on = 0; g_bis_trace = g_bis_lo; VKLOG("bisection: draw %d of %d is the first the driver refuses (traced in the next submission)", g_bis_lo, draws_seen); }
     vk_bisect_reset_count();
 }
-void vk_ubd_land_drop(void) { for (int i = 0; i < g_nubd; i++) free(g_ubd[i].own); g_nubd = 0; g_ubd_gen++; }
+void vk_ubd_land_drop(void) { for (int i = 0; i < g_nubd; i++) free(g_ubd[i].own); ubd_clear(); }
 // Landed updates still in flight: their copies are queued but the GPU may not have run them, so memory may not hold them yet; a shadow built on the
 // CPU (vk_ubd_read) applies them over memory until their submission completes. Without this a shadow mixed the newest update with the frame before's
 // memory (shadows detached from moving characters, far pedestrians flickering).
@@ -1555,9 +1619,13 @@ void vk_ubd_land(VkCommandBuffer cb) {   // outside a render pass
     for (int i = 0; i < g_nubd; i++) { VkBuffer db; VkDeviceSize dof; if (vk_buf_at(g_ubd[i].lo, g_ubd[i].hi - g_ubd[i].lo, &db, &dof)) {
         VkBufferCopy r = {g_ubd[i].so, dof, g_ubd[i].hi - g_ubd[i].lo}; vkCmdCopyBuffer(cb, g_ubd[i].sb, db, 1, &r); sub_gpu_wrote(g_ubd[i].lo, g_ubd[i].hi - g_ubd[i].lo); } }
     vk_img_barrier_all(cb);
-    g_ubd_landed += (uint64_t)g_nubd; g_nubd = 0; g_ubd_gen++;
+    g_ubd_landed += (uint64_t)g_nubd; ubd_clear();
 }
-int vk_ubd_overlaps(uint64_t a, uint64_t n) { for (int i = 0; i < g_nubd; i++) if (g_ubd[i].lo < a + n && a < g_ubd[i].hi) return 1; return 0; }
+int vk_ubd_overlaps(uint64_t a, uint64_t n) {
+    if (!g_nubd || !n || a > UINT64_MAX - n || (ubd_filter_on() && ubd_filter_miss(a, a + n))) return 0;
+    for (int i = 0; i < g_nubd; i++) if (g_ubd[i].lo < a + n && a < g_ubd[i].hi) return 1;
+    return 0;
+}
 // GPU writes to pool memory (buffer copies and fills, texture → buffer copies, storage buffers of dispatches) whose submission may not have completed:
 // until it has, a CPU read of that memory (vk_ubd_read: a shadow, a handle in a uniform buffer) may see the bytes from before them or after them
 typedef struct { uint64_t lo, hi, fence; } gpuw_t;
@@ -1641,12 +1709,16 @@ void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst) {
 }
 // a uniform binding [a, a + n) that deferred updates overlap: its shadow (0 when none overlaps). Shadows are kept per (address, size) until the next update.
 int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off) {
-    if (!g_nubd || !vk_ubd_overlaps(a, n)) return 0;   // (a binding no deferred update touches reads memory on the GPU, after the in-flight copies: no shadow needed)
+    if (!g_nubd || !n || a > UINT64_MAX - n) return 0;
+    if (ubd_filter_on() && ubd_filter_miss(a, a + n)) return 0;
     enum { NC = 64 }; static struct { uint64_t a, n, gen; VkBuffer b; VkDeviceSize o; } c[NC];
     unsigned k = (unsigned)((a ^ n * 0x9E3779B97F4A7C15ull) >> 6) % NC;
     extern int g_x_noshc; if (c[k].a == a && c[k].n == n && c[k].gen == g_ubd_gen && !g_x_noshc) { *buf = c[k].b; *off = c[k].o; return 1; }
-    uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, buf, off); vk_ubd_read(a, n, d); g_ubd_bytes += n;
-    c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].b = *buf; c[k].o = *off; g_ubd_shadows++;
+    int i; for (i = g_nubd - 1; i >= 0; i--) if (g_ubd[i].lo < a + n && a < g_ubd[i].hi) break;
+    if (i < 0) return 0;   // the binding can already read the pool's buffer
+    uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, buf, off);
+    vk_ubd_read(a, n, d); g_ubd_bytes += n; g_ubd_shadows++;
+    c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].b = *buf; c[k].o = *off;
     return 1;
 }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
@@ -1705,6 +1777,18 @@ static void *completion_main(void *a) {
         for (int i = 0; i < c->n; i++) {
             post_op *o = &c->ops[i];
             if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; continue; }
+            if (o->kind == 3) {
+                const uint8_t *gpu = (const uint8_t *)o->val, *cpu = (const uint8_t *)(uintptr_t)o->addr;
+                static unsigned checked, failed;
+                for (uint32_t row = 0; row < o->mode; row++) {
+                    if (!memcmp(gpu + (size_t)row * o->type, cpu + (size_t)row * o->v, o->v)) continue;
+                    VKLOG("[RED] packaged texture detile: byte mismatch, %u bytes x %u rows, row %u", o->v, o->mode, row);
+                    failed++;
+                    break;
+                }
+                if (++checked % 8 == 0) VKLOG("packaged texture detile: byte check %u, mismatches %u", checked, failed);
+                continue;
+            }
             uint64_t ts = now, tq;
             if (o->q >= 0 && tend && vkGetQueryPoolResults(V.dev, g_cq, (uint32_t)o->q, 1, 8, &tq, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && tq <= tend) {
                 uint64_t back = (uint64_t)((double)(tend - tq) * V.props.limits.timestampPeriod * 12 / 625); if (back < now) ts = now - back; }

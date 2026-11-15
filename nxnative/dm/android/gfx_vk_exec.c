@@ -55,7 +55,7 @@ static void state_reset(void) {
     S.smask[0] = S.smask[1] = S.swmask[0] = S.swmask[1] = 0xff;
     for (int i = 0; i < 8; i++) { S.blend[i].target = i; S.blend[i].src_rgb = S.blend[i].src_a = 2; S.blend[i].dst_rgb = S.blend[i].dst_a = 1; S.blend[i].eq_rgb = S.blend[i].eq_a = 1; }
 }
-static void prewarm_start(void); static void compute_warm_start(void); static void build_dump(void);
+static void prewarm_start(int blocking); static void compute_warm_start(int blocking); static void shader_pairs_warm(void); static void build_dump(void);
 static uint64_t g_set_epoch = 1;   // the submission the descriptor set cache belongs to (stage_set)
 static int32_t g_pass_bb[4];   // bounding box of the scissors the open pass's draws used (x0 y0 x1 y1)
 static int g_cb_draws;   // draws in the command buffer being recorded (vk_cmd_split after DM_VK_CB_DRAWS draws, 0 = never)
@@ -225,7 +225,24 @@ static void render_cond(const p_render_cond *rc) {
 }
 
 static void exec_begin(int continuing) {   // internal segments retain the current logical NVN and conditional state
-    static int inited; if (!inited) { inited = 1; state_reset(); crash_add_note_hook(build_dump); prewarm_start(); compute_warm_start(); }
+    static int inited;
+    if (!inited) {
+        inited = 1;
+        state_reset();
+        crash_add_note_hook(build_dump);
+        const char *setting = getenv("DM_VK_PREWARM_BEFORE_DRAW");
+        int blocking = setting && atoi(setting) && !getenv("DM_VK_NOPREWARM");
+        uint64_t start = blocking ? tick() : 0;
+        prewarm_start(blocking);
+        compute_warm_start(blocking);
+        if (blocking) {
+            void vk_pipeline_cache_save(void);
+            const char *pairs = getenv("DM_VK_WARM_SHADER_PAIRS");
+            if (pairs && atoi(pairs)) shader_pairs_warm();
+            vk_pipeline_cache_save();
+            VKLOG("prewarm before first draw: finished in %.0f ms", (tick() - start) / 1e6);
+        }
+    }
     if (!continuing) { g_rc_npend = 0; g_rc_skip = 0; }
     { void vk_tex_release_drain(void); vk_tex_release_drain(); }   // Finalized textures' CPU-written marks that no queued job needs any more (gfx_vk_tex.c)
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_cb_draws = 0; g_ord_parts = 0; g_psplit_now = 0; g_set_epoch++; x_read();
@@ -1084,29 +1101,131 @@ static void pipe_record(const pkey *k) {   // (under g_pipe_mu: only queued here
     pthread_cond_signal(&g_precq_cv); pthread_mutex_unlock(&g_precq_mu);
 }
 static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done;
+static size_t g_pw_built, g_pw_present, g_pw_missing, g_pw_failed;
+static void prewarm_record_result(size_t *result) {
+    __atomic_add_fetch(result, 1, __ATOMIC_RELAXED);
+    size_t done = __atomic_add_fetch(&g_pw_done, 1, __ATOMIC_ACQ_REL);
+    if (done == g_pw_n) {
+        VKLOG("prewarm: graphics %zu/%zu ready (%zu built, %zu already ready, %zu missing shaders, %zu failed)",
+            __atomic_load_n(&g_pw_built, __ATOMIC_RELAXED) + __atomic_load_n(&g_pw_present, __ATOMIC_RELAXED), g_pw_n,
+            __atomic_load_n(&g_pw_built, __ATOMIC_RELAXED), __atomic_load_n(&g_pw_present, __ATOMIC_RELAXED),
+            __atomic_load_n(&g_pw_missing, __ATOMIC_RELAXED), __atomic_load_n(&g_pw_failed, __ATOMIC_RELAXED));
+    } else if (done % 500 == 0) VKLOG("prewarm: checked %zu of %zu graphics pipelines", done, g_pw_n);
+}
+static VkPipeline prewarm_build(const pkey *k, int *missing) {
+    vkshader_t *stg[3] = {0};
+    VkDescriptorSetLayout dsl[5] = {0};
+    int nsets = 0;
+    *missing = 0;
+    for (int s = 0; s < 3; s++) {
+        if (!k->key[s] || (s == 1 && k->raster_discard)) continue;
+        stg[s] = vk_shader(k->key[s], s);
+        if (!stg[s]) { *missing = 1; return VK_NULL_HANDLE; }
+        dsl[stg[s]->set] = stg[s]->dsl;
+        if (stg[s]->set + 1 > nsets) nsets = stg[s]->set + 1;
+    }
+    if (!stg[0]) { *missing = 1; return VK_NULL_HANDLE; }
+    return build_pipeline(k, vk_pipeline_layout(dsl, nsets), stg);
+}
 static void *prewarm_thread(void *arg) {
-    (void)arg; pthread_setname_np(pthread_self(), "vk prewarm");
-    setpriority(PRIO_PROCESS, 0, 10);   // below the game's threads: prewarm uses idle cores
+    if (!arg) {
+        pthread_setname_np(pthread_self(), "vk prewarm");
+        setpriority(PRIO_PROCESS, 0, 10);   // background prewarm uses idle cores
+    }
     for (;;) {
         size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_n) break;
         const pkey *k = &g_pw[i];
-        pthread_mutex_lock(&g_pipe_mu); int have = nvn_hm_get(&g_pipes, k) != NULL; pthread_mutex_unlock(&g_pipe_mu);
-        if (have) continue;
-        vkshader_t *stg[3] = {0}; int ok = 1;
-        for (int s = 0; s < 3; s++) if (k->key[s] && !(s == 1 && k->raster_discard)) { stg[s] = vk_shader(k->key[s], s); if (!stg[s]) ok = 0; }
-        if (!ok || !stg[0]) continue;
-        VkDescriptorSetLayout dsl[5] = {0}; int nsets = 0;
-        for (int s = 0; s < 3; s++) if (stg[s]) { dsl[stg[s]->set] = stg[s]->dsl; if (stg[s]->set + 1 > nsets) nsets = stg[s]->set + 1; }
-        VkPipeline p = build_pipeline(k, vk_pipeline_layout(dsl, nsets), stg);
+        pthread_mutex_lock(&g_pipe_mu); VkPipeline existing = nvn_hm_get(&g_pipes, k); pthread_mutex_unlock(&g_pipe_mu);
+        if (existing) { prewarm_record_result(existing == (VkPipeline)1 ? &g_pw_failed : &g_pw_present); continue; }
+        int missing;
+        VkPipeline p = prewarm_build(k, &missing);
+        if (missing) { prewarm_record_result(&g_pw_missing); continue; }
+        if (!p || p == (VkPipeline)1) { prewarm_record_result(&g_pw_failed); continue; }
         pthread_mutex_lock(&g_pipe_mu);
-        if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, p); else if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL);
+        if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, p); else vkDestroyPipeline(V.dev, p, NULL);
         pthread_mutex_unlock(&g_pipe_mu);
-        size_t d = __atomic_add_fetch(&g_pw_done, 1, __ATOMIC_RELAXED);
-        if (d == g_pw_n || d % 500 == 0) VKLOG("prewarm: %zu of %zu pipelines", d, g_pw_n);
+        prewarm_record_result(&g_pw_built);
     }
     return NULL;
 }
-static void prewarm_start(void) {
+// PWA1 contains source shader pairs and their reflected 2-bit I/O classes.
+// Create a representative pipeline per pair to seed the driver cache. These
+// states are never bound or added to the exact recorded-pipeline inventory.
+typedef struct { uint64_t vertex, fragment; uint32_t inputs, outputs; } pair_warm_record;
+_Static_assert(sizeof(pair_warm_record) == 24, "PWA1 record size");
+typedef struct {
+    const pair_warm_record *records;
+    uint32_t count, next, done, missing, failed;
+} pair_warm_job;
+
+static void *shader_pairs_worker(void *arg) {
+    pair_warm_job *job = arg;
+    static const VkFormat inputs[] = { VK_FORMAT_UNDEFINED, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                      VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT };
+    static const VkFormat outputs[] = { VK_FORMAT_UNDEFINED, VK_FORMAT_R8G8B8A8_UNORM,
+                                       VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT };
+    for (;;) {
+        uint32_t i = __atomic_fetch_add(&job->next, 1, __ATOMIC_RELAXED);
+        if (i >= job->count) return NULL;
+        const pair_warm_record *r = &job->records[i];
+        pkey k = { .key = {r->vertex, r->fragment}, .topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                   .front = 1, .mode = 2, .samples = VK_SAMPLE_COUNT_1_BIT, .clip_neg1 = !g_depth_zero,
+                   .dfmt = (r->outputs & (1u << 16)) ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED };
+        for (uint32_t loc = 0; loc < 16; loc++) {
+            VkFormat format = inputs[(r->inputs >> (2 * loc)) & 3];
+            if (format == VK_FORMAT_UNDEFINED) continue;
+            k.attr[k.nattr++] = (typeof(k.attr[0])){loc, 0, format, loc * 16};
+            k.nbind = 1;
+            k.bind[0].stride = (loc + 1) * 16;
+        }
+        for (uint32_t loc = 0; loc < 8; loc++) {
+            k.cfmt[loc] = outputs[(r->outputs >> (2 * loc)) & 3];
+            if (k.cfmt[loc] == VK_FORMAT_UNDEFINED) continue;
+            k.ncol = loc + 1;
+            k.wmask[loc] = 15;
+        }
+        int missing;
+        VkPipeline p = prewarm_build(&k, &missing);
+        if (p && p != (VkPipeline)1) vkDestroyPipeline(V.dev, p, NULL);
+        else __atomic_add_fetch(missing ? &job->missing : &job->failed, 1, __ATOMIC_RELAXED);
+        uint32_t done = __atomic_add_fetch(&job->done, 1, __ATOMIC_RELAXED);
+        if (done % 256 == 0) VKLOG("shader pair prewarm: checked %u/%u", done, job->count);
+    }
+}
+
+static void shader_pairs_warm(void) {
+    const char *root = getenv("DM_ROOT");
+    if (!root) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/vk_shader_pairs.bin", root);
+    FILE *f = fopen(path, "rb");
+    if (!f) { VKLOG("shader pair prewarm: could not open manifest"); return; }
+    uint32_t header[2];
+    pair_warm_record *records = NULL;
+    if (fread(header, sizeof header, 1, f) == 1 && header[0] == 0x31415750u &&
+        header[1] > 0 && header[1] <= 100000) {
+        records = malloc(header[1] * sizeof(*records));
+        if (records && (fread(records, sizeof(*records), header[1], f) != header[1] || fgetc(f) != EOF)) {
+            free(records);
+            records = NULL;
+        }
+    }
+    fclose(f);
+    if (!records) { VKLOG("shader pair prewarm: invalid manifest"); return; }
+    pair_warm_job job = { .records = records, .count = header[1] };
+    uint64_t start = tick();
+    VKLOG("shader pair prewarm: %u source pairs", job.count);
+    pthread_t workers[2];
+    size_t started = 0;
+    for (size_t i = 0; i < sizeof workers / sizeof *workers; i++)
+        if (!pthread_create(&workers[started], NULL, shader_pairs_worker, &job)) started++;
+    shader_pairs_worker(&job);
+    for (size_t i = 0; i < started; i++) pthread_join(workers[i], NULL);
+    VKLOG("shader pair prewarm: %u/%u ready (%u missing shaders, %u failed) in %.0f ms",
+        job.count - job.missing - job.failed, job.count, job.missing, job.failed, (tick() - start) / 1e6);
+    free(records);
+}
+static void prewarm_start(int blocking) {
     const char *root = getenv("DM_ROOT"); if (!root) return;
     char path[1024]; snprintf(path, sizeof path, "%s/vk_pipelines.bin", root);
     uint32_t hdr[2] = {PIPE_MAGIC, (uint32_t)sizeof(pkey)}, fh[2] = {0};
@@ -1121,7 +1240,20 @@ static void prewarm_start(void) {
     if (!g_pw_n || getenv("DM_VK_NOPREWARM")) { VKLOG("prewarm: %zu pipelines recorded%s", g_pw_n, g_pw_n ? ", off (DM_VK_NOPREWARM)" : ""); return; }
     long nc = sysconf(_SC_NPROCESSORS_ONLN); int nt = nc >= 8 ? 3 : nc >= 4 ? 2 : 1;
     VKLOG("prewarm: %zu recorded pipelines on %d threads", g_pw_n, nt);
-    for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, NULL); pthread_attr_destroy(&a); }
+    pthread_t workers[3];
+    int started = 0;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    if (!blocking) pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    for (int i = 0; i < nt; i++) {
+        if (!pthread_create(&workers[started], &a, prewarm_thread, blocking ? &g_pw_n : NULL)) started++;
+    }
+    pthread_attr_destroy(&a);
+    if (blocking) {
+        // If no worker could be created, the render thread still finishes the prewarm.
+        if (!started) prewarm_thread(&g_pw_n);
+        for (int i = 0; i < started; i++) pthread_join(workers[i], NULL);
+    }
 }
 // ---- what each thread is building, for the crash dump. Issue #64: Super Mario Bros. Wonder crashed in the Adreno 750's shader compiler (libllvm-qgl.so, driver 512.762)
 // at its title scene, with no log line to say which pipeline or which thread; and a pipeline that crashes is never recorded for the prewarm, so every run met it again.
@@ -2385,24 +2517,31 @@ static VkPipeline compute_build(vkshader_t *cs, uint64_t um, uint64_t im) {   //
 // particle emitters run on compute shaders (EffectPtcl), and the first cap throw at a breakable object built one on the replay thread (a 65 ms frame), the first scenes
 // several. A game has few (Odyssey 41), so at the first submission a background thread builds every compute shader in the bundle with no integer-texel variant (up to a cap, below)
 static void *compute_warm(void *arg) {
-    (void)arg; pthread_setname_np(pthread_self(), "vk compute warm"); setpriority(PRIO_PROCESS, 0, 10);
-    int vk_shader_keys(uint32_t stage, uint64_t *out, int max); static uint64_t keys[4096]; int n = vk_shader_keys(5, keys, 4096), made = 0; uint64_t t0 = tick();
+    if (!arg) {
+        pthread_setname_np(pthread_self(), "vk compute warm");
+        setpriority(PRIO_PROCESS, 0, 10);
+    }
+    int vk_shader_keys(uint32_t stage, uint64_t *out, int max); static uint64_t keys[4096]; int n = vk_shader_keys(5, keys, 4096), made = 0, failed = 0, present = 0; uint64_t t0 = tick();
     // A bundle with many compute shaders is left to the replay: Monster Hunter Rise's (4096 or more) held ~550 MB more from the title on, and a Retroid Pocket 5
     // (Adreno 650, 8 GB) ran out of GPU memory loading the first area (vkAllocateMemory -2 at a 4 MB pool). DM_VK_COMPUTE_WARM_MAX (start-up, default 256): the most made ahead
     { const char *e = getenv("DM_VK_COMPUTE_WARM_MAX"); int cap = e ? atoi(e) : 256;
       if (n > cap) { VKLOG("compute pipelines made ahead: none, the bundle has %d%s compute shaders (more than %d, DM_VK_COMPUTE_WARM_MAX)", n, n == 4096 ? " or more" : "", cap); return NULL; } }
     for (int i = 0; i < n; i++) {
         uint64_t ck[3] = {keys[i], 0, 0};
-        pthread_mutex_lock(&g_cpipe_mu); int have = nvn_hm_get(&g_cpipes, ck) != NULL; pthread_mutex_unlock(&g_cpipe_mu);
-        vkshader_t *cs = have ? NULL : vk_shader(keys[i], 5); if (!cs) continue;
-        VkPipeline p = compute_build(cs, 0, 0); made++;
-        pthread_mutex_lock(&g_cpipe_mu); if (!nvn_hm_get(&g_cpipes, ck)) nvn_hm_put(&g_cpipes, ck, p); else if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); pthread_mutex_unlock(&g_cpipe_mu);
+        pthread_mutex_lock(&g_cpipe_mu); VkPipeline existing = nvn_hm_get(&g_cpipes, ck); pthread_mutex_unlock(&g_cpipe_mu);
+        if (existing) { if (existing == (VkPipeline)1) failed++; else present++; continue; }
+        vkshader_t *cs = vk_shader(keys[i], 5); if (!cs) { failed++; continue; }
+        VkPipeline p = compute_build(cs, 0, 0);
+        if (!p || p == (VkPipeline)1) { failed++; continue; }
+        made++;
+        pthread_mutex_lock(&g_cpipe_mu); if (!nvn_hm_get(&g_cpipes, ck)) nvn_hm_put(&g_cpipes, ck, p); else vkDestroyPipeline(V.dev, p, NULL); pthread_mutex_unlock(&g_cpipe_mu);
     }
-    VKLOG("compute pipelines made ahead: %d of %d compute shaders in %.0f ms", made, n, (tick() - t0) / 1e6);
+    VKLOG("prewarm: compute %d/%d ready (%d built, %d already ready, %d failed) in %.0f ms", made + present, n, made, present, failed, (tick() - t0) / 1e6);
     return NULL;
 }
-static void compute_warm_start(void) {
+static void compute_warm_start(int blocking) {
     if (getenv("DM_VK_NOPREWARM")) return;
+    if (blocking) { compute_warm(&blocking); return; }
     pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, compute_warm, NULL); pthread_attr_destroy(&a);
 }
 // Validate all three indirect argument words before recording any copy. A pool can have several VkBuffers (chunks), and a slab's

@@ -7,9 +7,11 @@
 #include "hle.h"
 #include <mach/mach.h>
 #include "front.h"
+#include "romfs_image.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -35,7 +37,7 @@ _Static_assert(sizeof(DirectoryEntry) == 0x310, "DirectoryEntry layout");
 // Host: at mount, the committed directory commit (= $DM_SAVE) is clonefile'd as a whole tree into the working directory <commit>.work (APFS copy-on-write, nearly zero cost), and the mount points at the working directory,
 // all game reads and writes happen in the working directory; Commit = clonefile(work → <commit>.new), then renamex_np(RENAME_SWAP) swaps it atomically with commit, then the swapped-out old version is deleted.
 // Killed at any moment, commit is either the old version or the new version, never half-written / a mix of old and new; the next mount discards leftover .work / .new.
-typedef struct { char name[32]; char dir[1024]; char overlay[4096]; char commit[1024]; int ro; } mount_t;
+typedef struct { char name[32]; char dir[1024]; char overlay[4096]; char commit[1024]; int ro; romfs_img *image; } mount_t;
 static mount_t g_mnt[MAX_MOUNT];   // commit non-empty = transactional save mount
 static int g_nmnt;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -156,11 +158,101 @@ static int dm_fs_test_fail(const char *pt) {
 }
 static int in_txn_dir(const char *hp) { for (int i = 0; i < g_nmnt; i++) { size_t n = strlen(g_mnt[i].dir); if (g_mnt[i].commit[0] && !strncmp(hp, g_mnt[i].dir, n) && (hp[n] == '/' || !hp[n])) return 1; } return 0; }
 static int rm_tree(const char *p);
+
+static int sync_save_path(const char *path, int recursive) {
+    struct stat info;
+    if (lstat(path, &info)) return -1;
+    if (recursive && S_ISDIR(info.st_mode)) {
+        DIR *dir = opendir(path);
+        if (!dir) return -1;
+        int failed = 0;
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+            char child[PATH_MAX];
+            if (snprintf(child, sizeof child, "%s/%s", path, entry->d_name) >= (int)sizeof child) { failed = ENAMETOOLONG; break; }
+            if (sync_save_path(child, 1)) { failed = errno; break; }
+        }
+        closedir(dir);
+        if (failed) { errno = failed; return -1; }
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    int result = fsync(fd), saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return result;
+}
+
+static int sync_save_parent(const char *path) {
+    char parent[PATH_MAX];
+    if (strlcpy(parent, path, sizeof parent) >= sizeof parent) { errno = ENAMETOOLONG; return -1; }
+    char *slash = strrchr(parent, '/');
+    if (!slash) return sync_save_path(".", 0);
+    if (slash == parent) slash[1] = 0;
+    else *slash = 0;
+    return sync_save_path(parent, 0);
+}
+
+static int recover_save_directory(const char *path) {
+    char previous[PATH_MAX];
+    if (snprintf(previous, sizeof previous, "%s.previous", path) >= (int)sizeof previous) { errno = ENAMETOOLONG; return -1; }
+    struct stat info;
+    if (lstat(previous, &info)) return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(info.st_mode)) { errno = ENOTDIR; return -1; }
+    if (lstat(path, &info)) {
+        if (errno != ENOENT || rename(previous, path)) return -1;
+        LOG("fs recovered the previous save directory at %s", path);
+        return sync_save_parent(path);
+    }
+    if (!S_ISDIR(info.st_mode)) { errno = ENOTDIR; return -1; }
+    if (sync_save_parent(path)) return -1;
+    return rm_tree(previous);
+}
+
+// exFAT cannot exchange directories in one syscall. Keep a named recovery copy until the replacement is durable.
+static int replace_save_directory(const char *staged, const char *live) {
+    if (recover_save_directory(live)) return -1;
+    if (!renamex_np(staged, live, RENAME_SWAP)) { rm_tree(staged); return 0; }
+    if (errno != EINVAL && errno != ENOSYS && errno != ENOTSUP && errno != EOPNOTSUPP) return -1;
+    char previous[PATH_MAX];
+    if (snprintf(previous, sizeof previous, "%s.previous", live) >= (int)sizeof previous) { errno = ENAMETOOLONG; return -1; }
+    if (sync_save_path(staged, 1) || sync_save_parent(live) || rename(live, previous)) return -1;
+    if (sync_save_parent(live) || dm_fs_test_fail("savepublish") || rename(staged, live)) {
+        int saved_errno = errno;
+        if (!rename(previous, live)) sync_save_parent(live);
+        errno = saved_errno;
+        return -1;
+    }
+    if (sync_save_parent(live)) {
+        int saved_errno = errno;
+        if (!rename(live, staged) && !rename(previous, live)) sync_save_parent(live);
+        errno = saved_errno;
+        return -1;
+    }
+    // A failed cleanup leaves the recovery copy available for the next mount or commit.
+    if (rm_tree(previous)) LOG("fs could not clean the previous save directory at %s", previous);
+    LOG("fs committed save to %s using a recovery directory", live);
+    return 0;
+}
+
 static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nmnt; i++)
         if (!strcmp(g_mnt[i].name, name)) { pthread_mutex_unlock(&g_lock); return RES_OK; }
     if (g_nmnt >= MAX_MOUNT) die("mount table full");
+    struct stat image_info;
+    if (ro && !txn && !stat(dir, &image_info) && S_ISREG(image_info.st_mode)) {
+        romfs_img *image = romfs_image_open(dir);
+        if (!image || image->damaged || getenv("DM_ROMFS_OVERLAY")) {
+            romfs_image_close(image);
+            pthread_mutex_unlock(&g_lock);
+            LOG("[RED] fs cannot mount RomFS image %s", dir);
+            return RES_FAIL;
+        }
+        g_mnt[g_nmnt].image = image;
+        LOG("fs RomFS image %s: %llu entries", dir, (unsigned long long)image->n);
+    }
     strlcpy(g_mnt[g_nmnt].name, name, sizeof g_mnt[0].name);
     g_mnt[g_nmnt].ro = ro; g_mnt[g_nmnt].overlay[0] = 0; g_mnt[g_nmnt].commit[0] = 0;
     if (!strcmp(name, "rom") && getenv("DM_ROMFS_OVERLAY"))
@@ -173,6 +265,11 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
         strlcpy(g_mnt[g_nmnt].commit, g_mnt[k].commit, sizeof g_mnt[0].commit); strlcpy(g_mnt[g_nmnt].dir, g_mnt[k].dir, sizeof g_mnt[0].dir);
     } else if (txn) {
         char work[1100], neu[1100]; snprintf(work, sizeof work, "%s.work", dir); snprintf(neu, sizeof neu, "%s.new", dir);
+        if (recover_save_directory(dir) || recover_save_directory(work)) {
+            LOG("[RED] fs could not recover save %s (errno=%d)", dir, errno);
+            pthread_mutex_unlock(&g_lock);
+            return RES_FAIL;
+        }
         mkdir(dir, 0755);
         const char *why = NULL;
         if (!access(work, F_OK) && rm_tree(work)) why = "cannot clear the work directory left over from last time";
@@ -191,7 +288,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     if (!ro && !txn) mkdir(dir, 0755);
     LOG("fs mount %s: → %s%s%s", name, txn ? g_mnt[g_nmnt - 1].dir : dir, ro || txn_err ? " (read-only)" : txn ? " (transactional save: work directory, swapped in atomically on Commit)" : "", g_mnt[g_nmnt - 1].overlay[0] ? " (overlay first)" : "");
     // A read-only mount the host may not list: every lookup in it fails with EACCES and the game sees no files at all (issue #9: Mario vs. Donkey Kong then dereferenced a null at its first heap setup, which read as a crash of its own)
-    if (ro && !txn) { DIR *d = opendir(dir); int e = errno; struct stat st;
+    if (ro && !txn && !g_mnt[g_nmnt - 1].image) { DIR *d = opendir(dir); int e = errno; struct stat st;
         if (d) closedir(d);
         else if (e == ENOENT) ;   // a game with no RomFS of its own, or a stand-in that is not there: lookups answer "not found" as they should
         else if (!stat(dir, &st))
@@ -355,6 +452,60 @@ static int norm_rest(const char *rest, char *out, size_t n) {
     return 1;
 }
 // create only allows the last component to not exist yet; intermediate directories still need an exact match.
+static int64_t image_find(const romfs_img *image, const char *path) {
+    uint64_t current = 0;
+    while (*path) {
+        while (*path == '/') ++path;
+        if (!*path) break;
+        const char *end = strchr(path, '/');
+        if (!end) end = path + strlen(path);
+        size_t length = (size_t)(end - path);
+        const img_ent *directory = &image->e[current];
+        if (directory->type) { errno = ENOTDIR; return -1; }
+        uint64_t low = directory->a, high = low + directory->b;
+        while (low < high) {
+            uint64_t middle = low + (high - low) / 2;
+            const img_ent *entry = &image->e[middle];
+            int cmp = memcmp(image->names + entry->name, path, entry->nlen < length ? entry->nlen : length);
+            if (!cmp) cmp = (entry->nlen > length) - (entry->nlen < length);
+            if (!cmp) { current = middle; break; }
+            if (cmp < 0) low = middle + 1;
+            else high = middle;
+        }
+        if (low == high) { errno = ENOENT; return -1; }
+        path = end;
+    }
+    return (int64_t)current;
+}
+
+static int image_path(const char *path, int *mount_index, int64_t *entry_index) {
+    const char *colon = strchr(path, ':');
+    if (!colon) return 0;
+    PATH_LOCK();
+    size_t length = (size_t)(colon - path);
+    for (int i = 0; i < g_nmnt; ++i) {
+        const mount_t *mount = &g_mnt[i];
+        if (!mount->image || strlen(mount->name) != length || strncmp(mount->name, path, length)) continue;
+        char normalized[1024];
+        *mount_index = i;
+        *entry_index = norm_rest(colon + 1, normalized, sizeof normalized) ? image_find(mount->image, normalized) : -1;
+        return 1;
+    }
+    return 0;
+}
+
+#define IMAGE_HANDLE_TAG (UINT64_C(1) << 58)
+#define IMAGE_HANDLE(h) (((h) >> 58) == 1)
+
+static const img_ent *image_file(uint64_t handle, const romfs_img **image) {
+    uint64_t mount = (handle ^ IMAGE_HANDLE_TAG) >> 32;
+    uint32_t index = (uint32_t)handle;
+    if (mount >= MAX_MOUNT || !g_mnt[mount].image || index >= g_mnt[mount].image->n) return NULL;
+    *image = g_mnt[mount].image;
+    const img_ent *entry = &(*image)->e[index];
+    return entry->type == ENT_FILE ? entry : NULL;
+}
+
 static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create) {
     const char *c = strchr(p, ':');
     if (!c) { errno = ENOENT; return 0; }
@@ -362,6 +513,7 @@ static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create)
     for (int i = 0; i < g_nmnt; i++) {
         if (strlen(g_mnt[i].name) != ln || strncmp(g_mnt[i].name, p, ln)) continue;
         if (ro) *ro = g_mnt[i].ro;
+        if (g_mnt[i].image) { errno = EROFS; return 0; }
         char normed[1024]; const char *rest = c + 1;
         if (strstr(rest, "/.")) { if (!norm_rest(rest, normed, sizeof normed)) return 0; rest = normed; }   // only paths with "." components are normalized; the rest walk component by component as before
         if (g_mnt[i].overlay[0] && !create) return rom_overlay_path(&g_mnt[i], rest, out, n);
@@ -391,7 +543,7 @@ static int set_guest_name(const char *hp, const char *path) {
     memcpy(guest, start, k); guest[k] = 0;
     const char *physical = strrchr(hp, '/') + 1;
     if (strcmp(physical, guest)) return setxattr(hp, FS_GUEST_NAME, guest, strlen(guest), 0, XATTR_NOFOLLOW);
-    if (!removexattr(hp, FS_GUEST_NAME, XATTR_NOFOLLOW) || errno == ENOATTR) return 0;
+    if (!removexattr(hp, FS_GUEST_NAME, XATTR_NOFOLLOW) || errno == ENOATTR || errno == ENOTSUP || errno == EOPNOTSUPP) return 0;
     return -1;
 }
 static Result err_res(const char *op, const char *path) {
@@ -622,8 +774,7 @@ static Result commit_mount_locked(int i, int *notify_error) {
         char re[1100]; snprintf(re, sizeof re, "%s.re", g_mnt[i].dir); int rerr = 0;
         if (!access(re, F_OK) && rm_tree(re)) rerr = errno ? errno : EIO;
         else if (dm_fs_test_fail("reclone") || clonefile(g_mnt[i].commit, re, 0)) { rerr = errno ? errno : EIO; rm_tree(re); }
-        else if (renamex_np(re, g_mnt[i].dir, RENAME_SWAP)) { rerr = errno ? errno : EIO; rm_tree(re); }
-        else rm_tree(re);                                               // the swapped-out tainted work directory
+        else if (replace_save_directory(re, g_mnt[i].dir)) { rerr = errno ? errno : EIO; rm_tree(re); }
         if (rerr) { save_poison(perr); LOG("[RED] save transaction: recloning the work directory failed errno=%d -- the work directory is left as it is and stays tainted (the next commit is refused again and retries), the committed version is unchanged", rerr); }
         LOG("[RED] save commit refused: a save write failed in this transaction errno=%d (0-byte files in the work directory: %s); the committed version is unchanged, the work directory %s%s", perr, tl ? torn + 1 : "none", rerr ? "could not be recloned (see the previous line)" : "was recloned from the committed version", nopen ? "; [RED] save files are still open" : "");
         *notify_error = perr;
@@ -632,12 +783,19 @@ static Result commit_mount_locked(int i, int *notify_error) {
     char neu[1100]; snprintf(neu, sizeof neu, "%s.new", g_mnt[i].commit);
     Result r = RES_OK;
     if (!access(neu, F_OK)) rm_tree(neu);
-    if (clonefile(g_mnt[i].dir, neu, 0)) { LOG("[RED] save commit: clonefile %s failed errno=%d (committed version unchanged)", neu, errno); r = RES_FAIL; }
-    else if (renamex_np(neu, g_mnt[i].commit, RENAME_SWAP)) { LOG("[RED] save commit: atomic swap failed errno=%d (committed version unchanged)", errno); rm_tree(neu); r = RES_FAIL; }
-    else rm_tree(neu);                                                  // the old version that was swapped out
+    if (clonefile(g_mnt[i].dir, neu, 0)) {
+        *notify_error = errno ? errno : EIO;
+        LOG("[RED] save commit: clonefile %s failed errno=%d (committed version unchanged)", neu, *notify_error);
+        r = RES_FAIL;
+    } else if (replace_save_directory(neu, g_mnt[i].commit)) {
+        *notify_error = errno ? errno : EIO;
+        LOG("[RED] save commit: replacement failed errno=%d", *notify_error);
+        rm_tree(neu);
+        r = RES_FAIL;
+    }
     // Timing readouts (integer microseconds, no floating point): how long the clone + atomic swap took; how long in total from this transaction's first save write to the end of the commit (the game writing files + the commit; 0 = no save write in this transaction)
     static int n; if (r == RES_OK) { uint64_t tc2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-        LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (clone + swap %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
+        LOG("save commit #%d: %s published to %s (%d save writes so far) (clone + publish %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
             (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
     }
     return r;
@@ -686,6 +844,14 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; the mount table is permanent, unmou
 
 // ---------- Files ----------
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
+    int mount; int64_t index;
+    if (image_path(path, &mount, &index)) {
+        if (index < 0) return err_res("open image file", path);
+        if (g_mnt[mount].image->e[index].type != ENT_FILE) return RES_PATH_NOT_FOUND;
+        if (mode & (MODE_WRITE | MODE_APPEND)) return RES_FAIL;
+        *out = IMAGE_HANDLE_TAG | ((uint64_t)mount << 32) | (uint64_t)index;
+        return RES_OK;
+    }
     HP(path);
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
     int fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
@@ -709,6 +875,17 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
 }
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) {
     if (!h) { *out = 0; return RES_FAIL; }   // a file handle is an fd; 0 is stdin and never a file the game opened: the null handle the game keeps using after a failed open
+    int fd = (int)h;
+    int64_t base = 0;
+    if (IMAGE_HANDLE(h)) {
+        const romfs_img *image;
+        const img_ent *entry = image_file(h, &image);
+        if (!entry || off < 0) { *out = 0; return RES_FAIL; }
+        if ((uint64_t)off >= entry->b) { *out = 0; return RES_OK; }
+        if (sz > entry->b - (uint64_t)off) sz = (size_t)(entry->b - (uint64_t)off);
+        fd = image->fd;
+        base = image->base + (int64_t)entry->a;
+    }
     size_t got = 0; int reprep = 0;
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
 #if defined(__ANDROID__)
@@ -718,7 +895,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     }
 #endif
     while (got < sz) {
-        ssize_t r = pread((int)h, (uint8_t *)buf + got, sz - got, off + got);
+        ssize_t r = pread(fd, (uint8_t *)buf + got, sz - got, base + off + got);
         if (r < 0) { if (errno == EINTR) continue;
             // The graphics layer write-protects tracked pages again after each upload (nvn_dirty.c), so a page made writable above can be read-only again by the time pread
             // writes it: a plain write would fault into the tracker's handler, a system call gets EFAULT. Prepare the rest again (unprotect, mark dirty) and read on. Monster Train 2
@@ -739,8 +916,9 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
         static int hash_on = -1; if (hash_on < 0) hash_on = getenv("DM_FSLOG_HASH") != NULL;   // DM_FSLOG_HASH=1: append a column with the FNV-1a 64 of the content read (to compare whether the bytes read from two resource packs match)
         uint64_t fh = 0xcbf29ce484222325ull; if (hash_on) for (size_t i = 0; i < got; i++) fh = (fh ^ ((uint8_t *)buf)[i]) * 0x100000001b3ull;
-        if (hash_on) fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\t%016llx\n", (now_ns() - g_t0_ns) / 1e9, (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", (long long)off, got, buf, (unsigned long long)fh);
-        else fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\n", (now_ns() - g_t0_ns) / 1e9, (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", (long long)off, got, buf);
+        const char *path = h < 4096 && g_fdpath[h] ? g_fdpath[h] : "?";
+        if (hash_on) fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\t%016llx\n", (now_ns() - g_t0_ns) / 1e9, path, (long long)off, got, buf, (unsigned long long)fh);
+        else fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\n", (now_ns() - g_t0_ns) / 1e9, path, (long long)off, got, buf);
         pthread_mutex_unlock(&g_fslog_lock); }
     if (g_flag.fs) {   // Read metering: print a line every 64 MiB accumulated or every 1000 reads
         static uint64_t n, bytes, next_b = 64 << 20; static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
@@ -751,7 +929,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp-srv → pwrite(2)", Result, h_fs_WriteFile, uint64_t h, int64_t off, const void *buf, size_t sz, const void *opt) {
-    if (!h) return RES_FAIL;
+    if (!h || IMAGE_HANDLE(h)) return RES_FAIL;
     (void)opt; size_t put = 0;
     if (g_fsave[(int)h & 0xffff]) {                                     // Save write injection point (for deterministic regression; only writes on the save mount are counted)
         static int cfg = -1, kill_n, fail_n, fail_e;
@@ -774,6 +952,13 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
 }
 HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", Result, h_fs_GetFileSize, int64_t *out, uint64_t h) {
     if (!h) return RES_FAIL;
+    if (IMAGE_HANDLE(h)) {
+        const romfs_img *image;
+        const img_ent *entry = image_file(h, &image);
+        if (!entry) return RES_FAIL;
+        *out = (int64_t)entry->b;
+        return RES_OK;
+    }
 #if defined(__ANDROID__)
     if (zon() && ZF(h)) { *out = (int64_t)ZF(h)->raw; return RES_OK; }   // a packed RomFS file: the original's size
 #endif
@@ -781,17 +966,17 @@ HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", 
     *out = st.st_size; return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", "fsp-srv → ftruncate(2)", Result, h_fs_SetFileSize, uint64_t h, int64_t sz) {
-    if (!h) return RES_FAIL;
+    if (!h || IMAGE_HANDLE(h)) return RES_FAIL;
     if (!ftruncate((int)h, sz)) return RES_OK;
     if (g_fsave[(int)h & 0xffff]) save_poison(errno);
     return err_res("ftruncate", "fd");
 }
 HLE_FORCE("_ZN2nn2fs9FlushFileENS0_10FileHandleE", "fsp-srv; host writes are already in the page cache, flushing is a no-op", Result, h_fs_FlushFile, uint64_t h) { (void)h; return RES_OK; }
 HLE_FORCE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", "fsp-srv → close(2)", void, h_fs_CloseFile, uint64_t h) {
-    if (!h) return;   // the null handle after a failed open (see ReadFile): do not touch fd 0
+    if (!h || IMAGE_HANDLE(h)) return;   // The image owns its descriptor, shared between entry handles.
     g_fmode[(int)h & 0xffff] = 0; g_fsave[(int)h & 0xffff] = 0; if (zon()) zf_close((int)h);
     close((int)h); }
-HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { return g_fmode[(int)h & 0xffff]; }
+HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { return IMAGE_HANDLE(h) ? MODE_READ : g_fmode[(int)h & 0xffff]; }
 
 // ---------- Path operations ----------
 HLE_FORCE("_ZN2nn2fs10CreateFileEPKcl", "fsp-srv → open(O_CREAT|O_EXCL)+ftruncate", Result, h_fs_CreateFile, const char *path, int64_t sz) {
@@ -862,6 +1047,12 @@ HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)", Result, h_fs_
 // The Great Ace Attorney Chronicles (SDK 10) imports it; a directory carries its guest name the same way as a file
 HLE_FORCE("_ZN2nn2fs15RenameDirectoryEPKcS2_", "fsp-srv → rename(2) of a directory", Result, h_fs_RenameDir, const char *from, const char *to) { return rename_entry(from, to); }
 HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → stat(2)", Result, h_fs_GetEntryType, int32_t *out, const char *path) {
+    int mount; int64_t index;
+    if (image_path(path, &mount, &index)) {
+        if (index < 0) return err_res("stat image entry", path);
+        *out = g_mnt[mount].image->e[index].type;
+        return RES_OK;
+    }
     HP(path); struct stat st;
     if (stat(hp, &st)) return err_res("stat", hp);
     *out = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; return RES_OK;
@@ -903,6 +1094,28 @@ static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
     free(resolved); free(rel); free(guest); free(parent); free(all); free(names); free(roots);
 }
 HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → opendir(3)", Result, h_fs_OpenDirectory, uint64_t *out, const char *path, int mode) {
+    int mount; int64_t index;
+    if (image_path(path, &mount, &index)) {
+        if (index < 0) return err_res("open image directory", path);
+        const romfs_img *image = g_mnt[mount].image;
+        const img_ent *entry = &image->e[index];
+        if (entry->type != ENT_DIR) return RES_PATH_NOT_FOUND;
+        dirh_t *handle = calloc(1, sizeof *handle);
+        if (!handle) return RES_FAIL;
+        handle->snap = calloc(entry->b ? (size_t)entry->b : 1, sizeof *handle->snap);
+        if (!handle->snap) { free(handle); return RES_FAIL; }
+        handle->mode = mode;
+        handle->nsnap = (int64_t)entry->b;
+        for (uint64_t i = 0; i < entry->b; ++i) {
+            const img_ent *child = &image->e[entry->a + i];
+            DirectoryEntry *out_entry = &handle->snap[i];
+            memcpy(out_entry->name, image->names + child->name, child->nlen);
+            out_entry->type = child->type;
+            out_entry->size = child->type == ENT_FILE ? (int64_t)child->b : 0;
+        }
+        *out = (uint64_t)handle;
+        return RES_OK;
+    }
     HP(path); DIR *d = opendir(hp);
     if (!d) return err_res("opendir", hp);
     dirh_t *h = calloc(1, sizeof *h); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
@@ -934,7 +1147,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
 }
 HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → closedir(3)", void, h_fs_CloseDirectory, uint64_t hh) {
     if (!hh) return;   // the game also closes after a failed open (handle 0): nothing to do in the original either
-    dirh_t *h = (dirh_t *)hh; closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
+    dirh_t *h = (dirh_t *)hh; if (h->d) closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
 }
 
 // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------
